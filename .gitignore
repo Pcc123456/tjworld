@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.mp4
+*.npz
+*.png
+episode_*.json
+outputs/
