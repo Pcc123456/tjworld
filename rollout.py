@@ -3,10 +3,13 @@
 
 """Autoregressive hand-pose video inference."""
 
+import importlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterator, Protocol
 
 import torch
+import torch.nn.functional as F
 
 ACTION_DIM = 57
 CHUNK_SIZE = 16
@@ -17,20 +20,89 @@ class VideoBackend(Protocol):
         """Return RGB float [3,17,H,W] in [0,1] from uint8 [3,1,H,W]."""
 
 
-class TorchScriptBackend:
-    """Load a local inference-only TorchScript module with the VideoBackend signature."""
+class DistributedCheckpointBackend:
+    """Use an installed inference runtime to load a local distributed checkpoint."""
 
-    def __init__(self, checkpoint: str, device: str = "cuda") -> None:
-        self.device = device
-        self.model = torch.jit.load(checkpoint, map_location=device).eval()
+    def __init__(self, checkpoint: Path, config_file: Path, output_dir: Path, runtime_package: str, fps: int, image_size: str, vae_path: Path | None = None) -> None:
+        self.fps = fps
+        self.image_size = image_size
+        if vae_path is None or not vae_path.is_file():
+            raise FileNotFoundError("A local video decoder weight file is required")
+        package = runtime_package.strip()
+        if not package or not all(part.isidentifier() for part in package.split(".")):
+            raise ValueError("--runtime-package must be an installed Python package name")
+        try:
+            init = importlib.import_module(f"{package}.inference.common.init")
+            init.init_script()
+            args_module = importlib.import_module(f"{package}.inference.args")
+            action_module = importlib.import_module(f"{package}.inference.action")
+            inference_module = importlib.import_module(f"{package}.inference.inference")
+        except ImportError as exc:
+            raise ImportError(f"Could not import inference runtime package {package!r}") from exc
+        self.build_action_batch = action_module.build_action_batch
+        self.finalize_data_batch = inference_module._finalize_data_batch
+        self.model_mode = args_module.ModelMode.FORWARD_DYNAMICS
+        overrides = [
+            f"model.config.tokenizer.vae_path={vae_path}",
+            "model.config.tokenizer.bucket_name=",
+            "model.config.tokenizer.object_store_credential_path_pretrained=",
+        ]
+        setup = args_module.OmniSetupOverrides(
+            checkpoint_path=str(checkpoint),
+            config_file=str(config_file),
+            output_dir=output_dir,
+            experiment_overrides=overrides,
+            guardrails=False,
+            dp_shard_size=1,
+            dp_replicate_size=1,
+            cp_size=1,
+            cfgp_size=1,
+            use_torch_compile=False,
+        ).build_setup()
+        init.init_output_dir(setup.output_dir)
+        self.pipe = setup.get_inference_cls().create(setup)
+        if self.pipe.num_replicas != 1 or self.pipe.index_in_replica != 0:
+            raise ValueError("This command requires one inference process; run with a single GPU")
+        config = self.pipe.model.config
+        if not config.action_gen or config.max_action_dim < ACTION_DIM:
+            raise ValueError("Checkpoint must support at least 57 hand-pose action dimensions")
 
     @torch.inference_mode()
     def generate(self, frame: torch.Tensor, actions: torch.Tensor, prompt: str, seed: int, num_steps: int, guidance: float, shift: float, sigma_max: float) -> torch.Tensor:
-        device = torch.device(self.device)
-        cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
-        with torch.random.fork_rng(devices=cuda_devices):
-            torch.manual_seed(seed)
-            return self.model(frame.to(self.device), actions.to(self.device), prompt, num_steps, guidance, shift, sigma_max).float().cpu()
+        model = self.pipe.model
+        if frame.ndim != 4 or frame.shape[:2] != (3, 1) or frame.dtype != torch.uint8:
+            raise ValueError("Expected RGB uint8 conditioning frame [3,1,H,W]")
+        self.pipe._run_text_guardrail("hand_pose_rollout", prompt)
+        padded_actions = F.pad(actions.float(), (0, model.config.max_action_dim - ACTION_DIM))
+        batch = self.build_action_batch(
+            video=frame,
+            action=padded_actions,
+            raw_action_dim=ACTION_DIM,
+            prompt=prompt,
+            view_point="ego_view",
+            domain_name="hand_pose",
+            model_mode=self.model_mode,
+            action_chunk_size=CHUNK_SIZE,
+            fps=self.fps,
+            resolution=self.image_size,
+            input_video_key=model.input_video_key,
+            device="cuda",
+            preserve_input_resolution=True,
+        )
+        batch = self.finalize_data_batch(batch, batch_size=1, model=model)
+        distilled = model.config.fixed_step_sampler_config is not None
+        outputs = model.generate_samples_from_batch(
+            batch,
+            sampler=model.fixed_step_sampler if distilled else None,
+            guidance=1.0 if distilled else guidance,
+            seed=[seed],
+            n_sample=1,
+            num_steps=num_steps,
+            shift=shift,
+            sigma_max=sigma_max,
+            normalize_cfg=False,
+        )
+        return ((1 + model.decode(outputs["vision"][0])) / 2).clamp(0, 1)[0].cpu()
 
 
 @dataclass(frozen=True)

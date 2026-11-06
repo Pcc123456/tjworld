@@ -12,7 +12,7 @@ import imageio.v2 as imageio
 import torch
 import torch.nn.functional as F
 
-from .rollout import CHUNK_SIZE, TorchScriptBackend, stream_rollout
+from .rollout import CHUNK_SIZE, DistributedCheckpointBackend, stream_rollout
 from .spatial import find_closest_target_size, reflection_pad_to_target, remove_reflection_padding
 from .world_oracle import WorldOracleEpisodeReader
 
@@ -20,8 +20,11 @@ from .world_oracle import WorldOracleEpisodeReader
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True, help="Local inference-only TorchScript module")
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--checkpoint-path", "--checkpoint", dest="checkpoint", type=Path, required=True, help="Local distributed checkpoint directory")
+    parser.add_argument("--config-file", type=Path, help="Matching model config JSON or YAML; defaults to checkpoint config.json")
+    parser.add_argument("--runtime-package", default="", help="Installed model inference runtime package")
+    parser.add_argument("--vae-path", type=Path, help="Local video decoder weights; auto-detected beside checkpoint when available")
+    parser.add_argument("--output-dir", "-o", type=Path, required=True)
     parser.add_argument("--episode-indices", type=int, nargs="*")
     parser.add_argument("--max-episodes", type=int)
     parser.add_argument("--max-chunks", type=int)
@@ -36,14 +39,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extrinsic-direction", choices=("source_to_reference", "reference_to_source"), default="source_to_reference")
     parser.add_argument("--invalid-frame-policy", choices=("stop", "error"), default="stop")
     parser.add_argument("--save-chunks", action="store_true")
-    parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if args.fps < 1 or args.num_steps < 1 or args.sigma_max <= 0 or not 0 <= args.guidance <= 7:
         parser.error("fps, num-steps and sigma-max must be positive; guidance must be in [0,7]")
     if args.max_episodes is not None and args.max_episodes < 1 or args.max_chunks is not None and args.max_chunks < 1:
         parser.error("max-episodes and max-chunks must be positive")
-    if not args.checkpoint.is_file():
-        parser.error(f"Checkpoint does not exist: {args.checkpoint}")
+    checkpoint = args.checkpoint.expanduser().resolve()
+    if (checkpoint / "model").is_dir():
+        checkpoint = checkpoint / "model"
+    if not checkpoint.is_dir() or not (checkpoint / ".metadata").is_file() or not any(checkpoint.glob("*.distcp")):
+        parser.error(f"Expected a local distributed checkpoint directory: {checkpoint}")
+    args.checkpoint = checkpoint
+    args.config_file = args.config_file.expanduser().resolve() if args.config_file else checkpoint / "config.json"
+    if not args.config_file.is_file():
+        parser.error(f"Model config does not exist: {args.config_file}")
+    if not args.runtime_package:
+        parser.error("--runtime-package is required to load the checkpoint's model architecture")
+    if args.vae_path is not None:
+        args.vae_path = args.vae_path.expanduser().resolve()
+        if not args.vae_path.is_file():
+            parser.error(f"Video decoder weights do not exist: {args.vae_path}")
+    else:
+        candidate = checkpoint.parent.parent / "wan22_vae" / "Wan2.2_VAE.pth"
+        if candidate.is_file():
+            args.vae_path = candidate.resolve()
+        else:
+            parser.error("Local video decoder weights were not found; pass --vae-path")
     return args
 
 
@@ -129,7 +150,7 @@ def main():
         if episode not in available:
             raise ValueError(f"Episode {episode} has no complete valid chunk")
         next(reader.iter_episode_chunks(episode, max_chunks=args.max_chunks))
-    backend = TorchScriptBackend(str(args.checkpoint), args.device)
+    backend = DistributedCheckpointBackend(args.checkpoint, args.config_file, args.output_dir, args.runtime_package, args.fps, args.image_size, args.vae_path)
     for episode in episodes:
         run_episode(reader, backend, episode, args)
 

@@ -1,1 +1,1 @@
-"""Standalone tjworld hand-pose inference package."""
+"""tjworld hand-pose inference package."""
